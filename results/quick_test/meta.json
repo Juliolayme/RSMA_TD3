@@ -1,0 +1,29 @@
+{
+  "system": {
+    "M (BS antennas)": 4,
+    "K (users)": 2,
+    "P_max (dBm)": 30,
+    "Noise power (dBm)": -80,
+    "Channel type": "rayleigh",
+    "State dim": 23,
+    "Action dim": 5,
+    "Time-varying": false
+  },
+  "agent": {
+    "alpha": 0.0001,
+    "beta": 0.001,
+    "input_dims": 23,
+    "tau": 0.001,
+    "batch_size": 64,
+    "n_actions": 5,
+    "action_noise_factor": 0.3,
+    "memory_max_size": 50,
+    "layer1_size": 400,
+    "layer2_size": 300,
+    "layer3_size": 256,
+    "layer4_size": 128
+  },
+  "episodes": 5,
+  "steps": 10,
+  "seed": 42
+}
