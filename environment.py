@@ -36,13 +36,13 @@ class RSMA_Env:
                  user_distances=None, frequency=2.4e9, path_loss_exp=3.0,
                  time_varying=False, channel_correlation=0.9,
                  step_num=100,
-                 # === RSMA reward shaping params (FIX #1) ===
-                 lambda_common=0.5,       # Trong so thuong cho common rate
-                 common_rate_threshold=0.1,  # Nguong toi thieu cho R_c
-                 collapse_penalty=2.0,    # Phat khi common rate qua thap
-                 # === Power/split floor (FIX #2, #3) ===
-                 min_power_common_ratio=0.05,  # Toi thieu 5% P_max cho common
-                 min_splitting_ratio=0.02,     # Toi thieu c_k >= 0.02
+                 # === RSMA reward shaping ===
+                 lambda_ratio=2.0,        # He so cho common_ratio = R_c/R_sum
+                 lambda_log=0.5,          # He so cho log(1 + 5*R_c)
+                 collapse_threshold=0.05, # Nguong R_c de phat collapse
+                 collapse_penalty=2.0,    # Gia tri phat khi R_c < threshold
+                 # === Power floor ===
+                 min_power_common_ratio=0.10,  # Toi thieu 10% P_max cho common
                  ):
         """
         Args:
@@ -70,14 +70,14 @@ class RSMA_Env:
         self.channel_correlation = channel_correlation
         self.step_num = step_num
 
-        # === RSMA reward shaping (FIX #1) ===
-        self.lambda_common = lambda_common
-        self.common_rate_threshold = common_rate_threshold
+        # === RSMA reward shaping ===
+        self.lambda_ratio = lambda_ratio
+        self.lambda_log = lambda_log
+        self.collapse_threshold = collapse_threshold
         self.collapse_penalty = collapse_penalty
 
-        # === Power/split floors (FIX #2, #3) ===
+        # === Power floor ===
         self.min_power_common_ratio = min_power_common_ratio
-        self.min_splitting_ratio = min_splitting_ratio
 
         # === Tham so kenh ===
         self.channel_params = {
@@ -189,9 +189,22 @@ class RSMA_Env:
         H = self.H  # (M, K)
         M, K = self.M, self.K
 
-        # === Common beamformer: MRT ===
-        # w_c = sum(h_k) / ||sum(h_k)||
-        h_sum = np.sum(H, axis=1, keepdims=True)  # (M, 1)
+        # === Common beamformer: Normalized MRT ===
+        # w_c = sum(h_k / ||h_k||) / || ... ||
+        #
+        # Tai sao KHONG dung MRT thong thuong (sum(h_k)):
+        #   - User gan BS co ||h_k|| lon → chiem uu the trong w_c
+        #   - User xa co ||h_k|| nho → beamformer khong huong den no
+        #   - R_c = min_k(R_ck) → user xa bi "keo chim" → R_c ≈ 0
+        #
+        # Normalized MRT: moi user dong gop HUONG (direction) nhu nhau
+        #   → Beamformer can bang giua tat ca users
+        #   → min(R_ck) cao hon → R_c > 0
+        # ================================================================
+        H_norms = np.linalg.norm(H, axis=0, keepdims=True)  # (1, K)
+        H_norms = np.maximum(H_norms, 1e-10)
+        H_unit = H / H_norms                                # (M, K), moi cot la unit vector
+        h_sum = np.sum(H_unit, axis=1, keepdims=True)        # (M, 1)
         norm_h_sum = np.linalg.norm(h_sum)
         if norm_h_sum > 1e-10:
             self.w_c = h_sum / norm_h_sum
@@ -382,26 +395,36 @@ class RSMA_Env:
         # ============================================
         R_total, R_c, R_private = self._compute_rates()
 
-        # R_sum = R_c + sum(R_p_k) vi sum(c_k)=1 (sau FIX A)
+        # R_sum = R_c + sum(R_p_k) vi sum(c_k)=1
         R_sum_private = np.sum(R_private)
         R_sum = np.sum(R_total)   # = R_c + R_sum_private (chinh xac)
 
-        # ============ REWARD (FIX B) ============
-        # Cong thuc: reward = (1 + lambda_c) * R_c + sum(R_p_k) - penalty
+        # ============ REWARD (Multi-Component) ============
+        # Cong thuc:
+        #   reward = R_sum
+        #          + λ_ratio * (R_c / R_sum)     ... khuyến khích tỷ lệ common
+        #          + λ_log   * log(1 + 5·R_c)    ... smooth bonus, không nổ
+        #          - penalty  (nếu R_c < threshold)
         #
-        # Tai sao:
-        #   - R_sum = R_c + sum(R_p_k) -> R_c chi co he so 1, yeu
-        #   - Nhan them (1+lambda_c) -> R_c co he so manh hon
-        #   - Khi lambda_c=0 -> reward = R_sum (SDMA-like, khong incentive)
-        #   - Khi lambda_c>0 -> agent co ly do tang R_c
-        #
-        # Penalty: phat khi common rate collapse ve 0
-        if R_c < self.common_rate_threshold:
-            collapse_pen = self.collapse_penalty * (self.common_rate_threshold - R_c)
-        else:
-            collapse_pen = 0.0
+        # Tai sao tot hon (1+λ)*R_c:
+        #   - R_c/R_sum ∈ [0,1]: normalized, gradient stable bat ke R_sum lon/nho
+        #   - log(1+5*R_c): tang nhanh khi R_c nho (khuyến khích khám phá),
+        #     bão hòa khi R_c lớn (không chiếm ưu thế)
+        #   - R_sum: giu muc tieu chinh (maximize throughput)
+        # ===================================================
+        eps = 1e-6
+        common_ratio = R_c / (R_sum + eps)                # ∈ [0, 1]
+        common_log_bonus = np.log(1.0 + 5.0 * R_c)       # smooth, > 0
 
-        reward = (1.0 + self.lambda_common) * R_c + R_sum_private - collapse_pen
+        reward = (R_sum
+                  + self.lambda_ratio * common_ratio
+                  + self.lambda_log * common_log_bonus)
+
+        # Collapse penalty: phat khi common rate qua nho
+        collapse_pen = 0.0
+        if R_c < self.collapse_threshold:
+            collapse_pen = self.collapse_penalty
+            reward -= collapse_pen
 
         # ============================================
         # 5. Luu tracking
