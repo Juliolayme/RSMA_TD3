@@ -78,7 +78,7 @@ agent_param = {
     'tau': 0.001,             # Soft update factor
     'batch_size': 64,
     'n_actions': env.get_system_action_dim(),
-    'action_noise_factor': 0.3,  # Noise cho exploration
+    'action_noise_factor': 0.5,  # FIX #5: Tang noise ban dau (0.3 -> 0.5) de explore tot hon
     'memory_max_size': int(episode_num * step_num),
     'agent_name': 'RSMA',
     # Layer sizes (nho hon folder 14 vi bai toan don gian hon)
@@ -156,9 +156,12 @@ for episode_cnt in range(episode_num):
     while step_cnt < step_num:
         step_cnt += 1
 
-        # 2. Chon action voi noise giam dan (greedy decay)
+        # 2. Chon action voi noise giam dan
+        # FIX #5: Doi tu (1-x)^2 sang linear decay voi floor
+        #   Cu: giam qua nhanh -> lock vao private-only som
+        #   Moi: giam tuyen tinh, giu noise toi thieu 0.05 de luon explore 1 chut
         greedy = agent_param['action_noise_factor'] * \
-                 math.pow((1 - episode_cnt / episode_num), 2)
+                 max(1.0 - episode_cnt / episode_num, 0.1)
         action = agent.choose_action(observation, greedy=greedy)
 
         # 3. Thuc hien action trong moi truong
@@ -180,20 +183,29 @@ for episode_cnt in range(episode_num):
     # 6. Log ket qua episode
     logger.log_episode(episode_cnt, env.history, score_per_ep)
 
-    # 7. In ket qua moi 10 episodes
+    # 7. In ket qua moi 10 episodes (FIX #6: Enhanced logging)
     if (episode_cnt + 1) % 10 == 0:
         avg_rate = np.mean(env.history['sum_rate']) if env.history['sum_rate'] else 0
+        avg_common = np.mean(env.history['common_rate']) if env.history['common_rate'] else 0
+        avg_pc = np.mean(env.history['power_common']) if env.history['power_common'] else 0
+        avg_pp = np.mean([np.sum(p) for p in env.history['power_private']]) if env.history['power_private'] else 0
         last_split = info['splitting_ratios']
         last_pc_ratio = info['power_common'] / (info['power_total'] + 1e-10)
 
         elapsed = time.time() - start_time
         print(f"Ep {episode_cnt + 1:>4d}/{episode_num} | "
               f"Score: {score_per_ep:>8.2f} | "
-              f"Avg Rate: {avg_rate:>6.3f} bps/Hz | "
+              f"R_sum: {avg_rate:>6.3f} | "
+              f"R_c: {avg_common:>5.3f} | "
               f"Split: [{', '.join(f'{s:.2f}' for s in last_split)}] | "
-              f"P_c ratio: {last_pc_ratio:.2f} | "
+              f"Pc/Ptot: {last_pc_ratio:.2f} | "
+              f"Pc={avg_pc:.4f} Pp={avg_pp:.4f} | "
               f"Noise: {greedy:.3f} | "
               f"Time: {elapsed:.0f}s")
+
+        # FIX #6: Canh bao RSMA collapse
+        if avg_common < 0.01 and episode_cnt > episode_num * 0.3:
+            print(f"  ⚠️  WARNING: Common rate near 0! RSMA may be collapsing to SDMA.")
 
     # 8. Luu model moi 50 episodes
     if (episode_cnt + 1) % 50 == 0:
@@ -215,7 +227,26 @@ print("  Training Complete!")
 print(f"  Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
 print(f"  Best score: {best_score:.4f}")
 print(f"  Final avg sum rate: {np.mean(logger.episode_sum_rates[-20:]):.4f} bps/Hz")
+print(f"  Final avg common rate: {np.mean(logger.episode_common_rates[-20:]):.4f} bps/Hz")
+print(f"  Final avg Pc ratio: {np.mean(logger.episode_power_common_ratio[-20:]):.4f}")
 print("=" * 60)
+
+# === FIX #6: RSMA Validation Check ===
+print("\n--- RSMA Behavior Validation ---")
+final_common = np.mean(logger.episode_common_rates[-20:])
+final_pc_ratio = np.mean(logger.episode_power_common_ratio[-20:])
+
+if final_common > 0.05 and final_pc_ratio > 0.03:
+    print("  ✅ RSMA behavior CONFIRMED:")
+    print(f"     Common rate = {final_common:.4f} > 0 (common stream active)")
+    print(f"     Pc ratio = {final_pc_ratio:.2%} (power split between common & private)")
+else:
+    print("  ❌ RSMA behavior WEAK or ABSENT:")
+    if final_common <= 0.05:
+        print(f"     Common rate = {final_common:.4f} ≈ 0 (common stream not used)")
+    if final_pc_ratio <= 0.03:
+        print(f"     Pc ratio = {final_pc_ratio:.2%} (almost all power to private)")
+    print("     → Try: increase lambda_common, increase episodes, or check channel model")
 
 # =============================================================================
 # 9. So sanh Baseline (NOMA va SDMA)

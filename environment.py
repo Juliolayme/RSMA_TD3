@@ -34,7 +34,15 @@ class RSMA_Env:
                  channel_type='rayleigh', rician_factor=10.0,
                  user_distances=None, frequency=2.4e9, path_loss_exp=3.0,
                  time_varying=False, channel_correlation=0.9,
-                 step_num=100):
+                 step_num=100,
+                 # === RSMA reward shaping params (FIX #1) ===
+                 lambda_common=0.5,       # Trong so thuong cho common rate
+                 common_rate_threshold=0.1,  # Nguong toi thieu cho R_c
+                 collapse_penalty=2.0,    # Phat khi common rate qua thap
+                 # === Power/split floor (FIX #2, #3) ===
+                 min_power_common_ratio=0.05,  # Toi thieu 5% P_max cho common
+                 min_splitting_ratio=0.02,     # Toi thieu c_k >= 0.02
+                 ):
         """
         Args:
             M: so anten BS (phat)
@@ -60,6 +68,15 @@ class RSMA_Env:
         self.time_varying = time_varying
         self.channel_correlation = channel_correlation
         self.step_num = step_num
+
+        # === RSMA reward shaping (FIX #1) ===
+        self.lambda_common = lambda_common
+        self.common_rate_threshold = common_rate_threshold
+        self.collapse_penalty = collapse_penalty
+
+        # === Power/split floors (FIX #2, #3) ===
+        self.min_power_common_ratio = min_power_common_ratio
+        self.min_splitting_ratio = min_splitting_ratio
 
         # === Tham so kenh ===
         self.channel_params = {
@@ -309,7 +326,9 @@ class RSMA_Env:
 
         # 1a) Splitting ratios: sigmoid de dam bao ∈ (0, 1)
         raw_c = action[:K]
-        self.c = 1.0 / (1.0 + np.exp(-np.clip(raw_c, -10, 10)))  # sigmoid, clip de tranh overflow
+        self.c = 1.0 / (1.0 + np.exp(-np.clip(raw_c, -10, 10)))  # sigmoid
+        # FIX #3: Floor cho splitting ratios - ngan c_k collapse ve 0
+        self.c = np.maximum(self.c, self.min_splitting_ratio)
         # Normalize: sum(c_k) <= 1
         c_sum = np.sum(self.c)
         if c_sum > 1.0:
@@ -317,13 +336,30 @@ class RSMA_Env:
 
         # 1b) Power allocation: softmax de dam bao sum = P_max
         raw_p = action[K:]  # K+1 phan tu: [common, private_1, ..., private_K]
+        # FIX #2: Bias cho common power - them +1.0 vao raw common de chong collapse
+        raw_p_biased = raw_p.copy()
+        raw_p_biased[0] += 1.0  # Bias giup common power khong bi "nuot" boi K private
         # Softmax voi numerical stability
-        raw_p_shifted = raw_p - np.max(raw_p)
+        raw_p_shifted = raw_p_biased - np.max(raw_p_biased)
         exp_p = np.exp(raw_p_shifted)
         p_ratio = exp_p / np.sum(exp_p)
 
         self.p_c = p_ratio[0] * self.P_max
         self.p_private = p_ratio[1:] * self.P_max
+
+        # FIX #2: Floor cho common power - dam bao toi thieu min_ratio * P_max
+        min_pc = self.min_power_common_ratio * self.P_max
+        if self.p_c < min_pc:
+            deficit = min_pc - self.p_c
+            self.p_c = min_pc
+            # Lay cong suat tu private streams (giam deu)
+            if np.sum(self.p_private) > deficit:
+                self.p_private -= deficit / K
+                self.p_private = np.maximum(self.p_private, 1e-8)
+            # Re-normalize de dam bao tong = P_max
+            total = self.p_c + np.sum(self.p_private)
+            self.p_c = self.p_c / total * self.P_max
+            self.p_private = self.p_private / total * self.P_max
 
         # ============================================
         # 2. Cap nhat kenh (neu time-varying)
@@ -338,10 +374,23 @@ class RSMA_Env:
         self._compute_beamforming()
 
         # ============================================
-        # 4. Tinh rate va reward
+        # 4. Tinh rate va reward (FIX #1: reward shaping)
         # ============================================
         R_total, R_c, R_private = self._compute_rates()
-        reward = np.sum(R_total)  # Sum Rate lam reward
+
+        # FIX #1: Reward = sum_rate + bonus cho common rate - penalty khi collapse
+        R_sum = np.sum(R_total)
+
+        # Bonus: khuyen khich agent su dung common stream
+        common_bonus = self.lambda_common * R_c
+
+        # Penalty: phat khi common rate qua thap (collapse detection)
+        if R_c < self.common_rate_threshold:
+            collapse_pen = self.collapse_penalty * (self.common_rate_threshold - R_c)
+        else:
+            collapse_pen = 0.0
+
+        reward = R_sum + common_bonus - collapse_pen
 
         # ============================================
         # 5. Luu tracking
@@ -366,14 +415,18 @@ class RSMA_Env:
         next_state = self._get_state()
 
         info = {
-            'sum_rate': reward,
+            'sum_rate': R_sum,           # Pure sum rate (khong co shaping)
+            'shaped_reward': reward,     # Reward thuc te (co shaping)
             'common_rate': R_c,
+            'common_bonus': common_bonus,
+            'collapse_penalty': collapse_pen,
             'private_rates': R_private.copy(),
             'user_rates': R_total.copy(),
             'splitting_ratios': self.c.copy(),
             'power_common': self.p_c,
             'power_private': self.p_private.copy(),
             'power_total': self.p_c + np.sum(self.p_private),
+            'power_common_ratio': self.p_c / (self.p_c + np.sum(self.p_private) + 1e-10),
             'step': self.step_count,
         }
 

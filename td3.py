@@ -267,9 +267,14 @@ class Agent:
                  n_actions=2, max_size=1000000,
                  layer1_size=400, layer2_size=300, layer3_size=256, layer4_size=128,
                  batch_size=64, update_actor_interval=2,
-                 noise='AWGN', agent_name='default'):
+                 noise='AWGN', agent_name='default',
+                 # FIX #4: Target policy smoothing params
+                 target_noise_std=0.2, target_noise_clip=0.5):
         self.gamma = gamma
         self.tau = tau
+        # FIX #4: Target policy smoothing (TD3 paper Section 5.3)
+        self.target_noise_std = target_noise_std
+        self.target_noise_clip = target_noise_clip
         self.memory = ReplayBuffer(max_size, input_dims, n_actions)
         self.batch_size = batch_size
         self.learn_step_cntr = 0
@@ -370,8 +375,15 @@ class Agent:
         self.critic_1.eval()
         self.critic_2.eval()
 
-        # Target actions (khong them noise o day de don gian, giong folder 14)
+        # FIX #4: Target Policy Smoothing - them noise vao target actions
+        # Day la feature QUAN TRONG cua TD3 (paper: "Target Policy Smoothing Regularization")
+        # Ngan critic overfit vao deterministic target action
         target_actions = self.target_actor.forward(new_state)
+        target_noise = T.clamp(
+            T.randn_like(target_actions) * self.target_noise_std,
+            -self.target_noise_clip, self.target_noise_clip
+        ).to(self.critic_1.device)
+        target_actions = T.clamp(target_actions + target_noise, -1.0, 1.0)
 
         # Twin target Q-values
         critic_value_1_ = self.target_critic_1.forward(new_state, target_actions)
