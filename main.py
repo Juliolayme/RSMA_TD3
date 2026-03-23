@@ -183,29 +183,30 @@ for episode_cnt in range(episode_num):
     # 6. Log ket qua episode
     logger.log_episode(episode_cnt, env.history, score_per_ep)
 
-    # 7. In ket qua moi 10 episodes (FIX #6: Enhanced logging)
+    # 7. In ket qua moi 10 episodes
     if (episode_cnt + 1) % 10 == 0:
+        # Lay pure sum rate (khong phai shaped reward) tu history
         avg_rate = np.mean(env.history['sum_rate']) if env.history['sum_rate'] else 0
         avg_common = np.mean(env.history['common_rate']) if env.history['common_rate'] else 0
         avg_pc = np.mean(env.history['power_common']) if env.history['power_common'] else 0
         avg_pp = np.mean([np.sum(p) for p in env.history['power_private']]) if env.history['power_private'] else 0
         last_split = info['splitting_ratios']
-        last_pc_ratio = info['power_common'] / (info['power_total'] + 1e-10)
+        pc_ratio = info['power_common_ratio']
 
         elapsed = time.time() - start_time
         print(f"Ep {episode_cnt + 1:>4d}/{episode_num} | "
-              f"Score: {score_per_ep:>8.2f} | "
+              f"Reward: {score_per_ep:>8.2f} | "
               f"R_sum: {avg_rate:>6.3f} | "
               f"R_c: {avg_common:>5.3f} | "
+              f"R_p: {avg_rate - avg_common:>5.3f} | "
               f"Split: [{', '.join(f'{s:.2f}' for s in last_split)}] | "
-              f"Pc/Ptot: {last_pc_ratio:.2f} | "
-              f"Pc={avg_pc:.4f} Pp={avg_pp:.4f} | "
-              f"Noise: {greedy:.3f} | "
-              f"Time: {elapsed:.0f}s")
+              f"Pc/P: {pc_ratio:.1%} | "
+              f"ε: {greedy:.3f} | "
+              f"{elapsed:.0f}s")
 
-        # FIX #6: Canh bao RSMA collapse
+        # Canh bao RSMA collapse
         if avg_common < 0.01 and episode_cnt > episode_num * 0.3:
-            print(f"  ⚠️  WARNING: Common rate near 0! RSMA may be collapsing to SDMA.")
+            print(f"  ⚠️  WARNING: R_c≈0! RSMA collapsing to SDMA.")
 
     # 8. Luu model moi 50 episodes
     if (episode_cnt + 1) % 50 == 0:

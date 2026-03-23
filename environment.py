@@ -26,8 +26,9 @@ class RSMA_Env:
     1) BS chia message cua user k thanh: common part (W_c) + private part (W_k)
     2) Tat ca common parts duoc gop va encode thanh 1 common stream
     3) Moi user giai ma common stream truoc (SIC), roi giai ma private stream
-    4) Rate user k = c_k * R_c + R_{p,k}
+    4) Rate user k = c_k * R_c + R_{p,k}  (voi sum(c_k) = 1)
        voi R_c = min_k{R_{c,k}} la common rate (bi gioi han boi user yeu nhat)
+    5) Sum rate = R_c + sum(R_{p,k})     (khi sum(c_k) = 1)
     """
 
     def __init__(self, M=4, K=2, P_max_dBm=30, noise_power_dBm=-80,
@@ -324,42 +325,45 @@ class RSMA_Env:
         # 1. Parse action -> bien vat ly
         # ============================================
 
-        # 1a) Splitting ratios: sigmoid de dam bao ∈ (0, 1)
+        # ===========================================================
+        # 1a) Splitting ratios: SOFTMAX de dam bao sum(c_k) = 1
+        #     (FIX A: cu dung sigmoid + "<=1" -> lang phi common rate)
+        #
+        #     Theo RSMA paper: sum(c_k) PHAI = 1
+        #     De R_sum = R_c + sum(R_p_k) (khong lang phi)
+        # ===========================================================
         raw_c = action[:K]
-        self.c = 1.0 / (1.0 + np.exp(-np.clip(raw_c, -10, 10)))  # sigmoid
-        # FIX #3: Floor cho splitting ratios - ngan c_k collapse ve 0
-        self.c = np.maximum(self.c, self.min_splitting_ratio)
-        # Normalize: sum(c_k) <= 1
-        c_sum = np.sum(self.c)
-        if c_sum > 1.0:
-            self.c = self.c / c_sum
+        raw_c_clipped = np.clip(raw_c, -10, 10)
+        raw_c_shifted = raw_c_clipped - np.max(raw_c_clipped)
+        exp_c = np.exp(raw_c_shifted)
+        self.c = exp_c / np.sum(exp_c)  # softmax -> sum = 1.0 chinh xac
 
-        # 1b) Power allocation: softmax de dam bao sum = P_max
+        # ===========================================================
+        # 1b) Power allocation: map [-1,1] -> [0,1] rồi normalize
+        #     (FIX C: bo softmax+bias hacky)
+        #
+        #     Actor output tanh ∈ [-1, 1]
+        #     -> (x+1)/2 ∈ [0, 1] -> normalize * P_max
+        # ===========================================================
         raw_p = action[K:]  # K+1 phan tu: [common, private_1, ..., private_K]
-        # FIX #2: Bias cho common power - them +1.0 vao raw common de chong collapse
-        raw_p_biased = raw_p.copy()
-        raw_p_biased[0] += 1.0  # Bias giup common power khong bi "nuot" boi K private
-        # Softmax voi numerical stability
-        raw_p_shifted = raw_p_biased - np.max(raw_p_biased)
-        exp_p = np.exp(raw_p_shifted)
-        p_ratio = exp_p / np.sum(exp_p)
+        p_positive = (raw_p + 1.0) / 2.0           # map [-1,1] -> [0,1]
+        p_positive = np.maximum(p_positive, 1e-6)   # tranh chia 0
 
+        # Normalize de tong = P_max
+        p_ratio = p_positive / np.sum(p_positive)
         self.p_c = p_ratio[0] * self.P_max
         self.p_private = p_ratio[1:] * self.P_max
 
-        # FIX #2: Floor cho common power - dam bao toi thieu min_ratio * P_max
+        # Enforce minimum common power SAU normalize
         min_pc = self.min_power_common_ratio * self.P_max
         if self.p_c < min_pc:
-            deficit = min_pc - self.p_c
             self.p_c = min_pc
-            # Lay cong suat tu private streams (giam deu)
-            if np.sum(self.p_private) > deficit:
-                self.p_private -= deficit / K
-                self.p_private = np.maximum(self.p_private, 1e-8)
-            # Re-normalize de dam bao tong = P_max
-            total = self.p_c + np.sum(self.p_private)
-            self.p_c = self.p_c / total * self.P_max
-            self.p_private = self.p_private / total * self.P_max
+            remaining = self.P_max - min_pc
+            pp_sum = np.sum(self.p_private)
+            if pp_sum > 1e-10:
+                self.p_private = self.p_private / pp_sum * remaining
+            else:
+                self.p_private = np.ones(K) * remaining / K
 
         # ============================================
         # 2. Cap nhat kenh (neu time-varying)
@@ -374,30 +378,38 @@ class RSMA_Env:
         self._compute_beamforming()
 
         # ============================================
-        # 4. Tinh rate va reward (FIX #1: reward shaping)
+        # 4. Tinh rate va reward
         # ============================================
         R_total, R_c, R_private = self._compute_rates()
 
-        # FIX #1: Reward = sum_rate + bonus cho common rate - penalty khi collapse
-        R_sum = np.sum(R_total)
+        # R_sum = R_c + sum(R_p_k) vi sum(c_k)=1 (sau FIX A)
+        R_sum_private = np.sum(R_private)
+        R_sum = np.sum(R_total)   # = R_c + R_sum_private (chinh xac)
 
-        # Bonus: khuyen khich agent su dung common stream
-        common_bonus = self.lambda_common * R_c
-
-        # Penalty: phat khi common rate qua thap (collapse detection)
+        # ============ REWARD (FIX B) ============
+        # Cong thuc: reward = (1 + lambda_c) * R_c + sum(R_p_k) - penalty
+        #
+        # Tai sao:
+        #   - R_sum = R_c + sum(R_p_k) -> R_c chi co he so 1, yeu
+        #   - Nhan them (1+lambda_c) -> R_c co he so manh hon
+        #   - Khi lambda_c=0 -> reward = R_sum (SDMA-like, khong incentive)
+        #   - Khi lambda_c>0 -> agent co ly do tang R_c
+        #
+        # Penalty: phat khi common rate collapse ve 0
         if R_c < self.common_rate_threshold:
             collapse_pen = self.collapse_penalty * (self.common_rate_threshold - R_c)
         else:
             collapse_pen = 0.0
 
-        reward = R_sum + common_bonus - collapse_pen
+        reward = (1.0 + self.lambda_common) * R_c + R_sum_private - collapse_pen
 
         # ============================================
         # 5. Luu tracking
         # ============================================
         self.prev_rates = R_total.copy()
 
-        self.history['sum_rate'].append(reward)
+        # FIX D: Luu PURE sum rate (khong phai shaped reward) de log/plot dung
+        self.history['sum_rate'].append(R_sum)
         self.history['common_rate'].append(R_c)
         self.history['private_rates'].append(R_private.copy())
         self.history['splitting_ratios'].append(self.c.copy())
@@ -415,16 +427,16 @@ class RSMA_Env:
         next_state = self._get_state()
 
         info = {
-            'sum_rate': R_sum,           # Pure sum rate (khong co shaping)
-            'shaped_reward': reward,     # Reward thuc te (co shaping)
-            'common_rate': R_c,
-            'common_bonus': common_bonus,
+            'sum_rate': R_sum,                       # Pure R_c + sum(R_p_k)
+            'shaped_reward': reward,                 # Reward thuc te (co shaping)
+            'common_rate': R_c,                      # R_c = min_k(R_{c,k})
+            'sum_private_rate': R_sum_private,       # sum(R_p_k)
             'collapse_penalty': collapse_pen,
-            'private_rates': R_private.copy(),
-            'user_rates': R_total.copy(),
-            'splitting_ratios': self.c.copy(),
-            'power_common': self.p_c,
-            'power_private': self.p_private.copy(),
+            'private_rates': R_private.copy(),       # R_p_k per user
+            'user_rates': R_total.copy(),            # c_k*R_c + R_p_k per user
+            'splitting_ratios': self.c.copy(),       # c_k, sum=1
+            'power_common': self.p_c,                # Pc (Watt)
+            'power_private': self.p_private.copy(),  # Pp_k (Watt)
             'power_total': self.p_c + np.sum(self.p_private),
             'power_common_ratio': self.p_c / (self.p_c + np.sum(self.p_private) + 1e-10),
             'step': self.step_count,
