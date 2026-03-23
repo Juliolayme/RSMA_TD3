@@ -63,7 +63,8 @@ class ChannelModel:
     """
 
     def __init__(self, M, K, channel_type='rayleigh', rician_factor=10.0,
-                 frequency=2.4e9, path_loss_exp=3.0, user_distances=None):
+                 frequency=2.4e9, path_loss_exp=3.0, user_distances=None,
+                 spatial_correlation=0.0):
         """
         Args:
             M: so anten BS
@@ -73,6 +74,10 @@ class ChannelModel:
             frequency: tan so song mang (Hz)
             path_loss_exp: he so suy hao duong truyen
             user_distances: khoang cach tu BS den moi user (m), shape (K,)
+            spatial_correlation: he so tuong quan kenh giua users ∈ [0, 1]
+                0.0 = doc lap hoan toan (SDMA tot, RSMA khong can)
+                0.5 = tuong quan trung binh (RSMA bat dau co loi)
+                0.8 = tuong quan cao (RSMA loi the ro ret)
         """
         self.M = M
         self.K = K
@@ -80,6 +85,7 @@ class ChannelModel:
         self.rician_factor = rician_factor
         self.frequency = frequency
         self.path_loss_exp = path_loss_exp
+        self.spatial_correlation = spatial_correlation
 
         # Khoang cach mac dinh neu khong truyen vao
         if user_distances is None:
@@ -107,6 +113,16 @@ class ChannelModel:
         if self.channel_type == 'rayleigh':
             # Rayleigh fading: h_k ~ CN(0, I/PL_k)
             H_iid = (np.random.randn(M, K) + 1j * np.random.randn(M, K)) / np.sqrt(2)
+
+            # === Spatial Correlation ===
+            # h_k = sqrt(ρ) * h_common + sqrt(1-ρ) * h_independent
+            # Khi ρ > 0: cac users co kenh tuong quan (ZF kem → RSMA co loi)
+            # Khi ρ = 0: kenh doc lap (ZF tot → RSMA khong can thiet)
+            rho = self.spatial_correlation
+            if rho > 0:
+                h_common = (np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)
+                H_iid = np.sqrt(rho) * h_common + np.sqrt(1 - rho) * H_iid
+
             # Ap dung path loss
             for k in range(K):
                 H_iid[:, k] /= np.sqrt(self.path_loss[k])
@@ -117,6 +133,12 @@ class ChannelModel:
             K_r = self.rician_factor
             H_los = self._generate_los_component()
             H_nlos = (np.random.randn(M, K) + 1j * np.random.randn(M, K)) / np.sqrt(2)
+
+            # Spatial correlation cho NLOS component
+            rho = self.spatial_correlation
+            if rho > 0:
+                h_common = (np.random.randn(M, 1) + 1j * np.random.randn(M, 1)) / np.sqrt(2)
+                H_nlos = np.sqrt(rho) * h_common + np.sqrt(1 - rho) * H_nlos
 
             H_rician = (np.sqrt(K_r / (K_r + 1)) * H_los +
                         np.sqrt(1 / (K_r + 1)) * H_nlos)

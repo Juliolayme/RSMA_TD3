@@ -37,6 +37,8 @@ parser.add_argument('--noise', type=float, default=-80, help='Cong suat nhieu dB
 parser.add_argument('--channel', type=str, default='rayleigh', choices=['rayleigh', 'rician'],
                     help='Loai kenh (default: rayleigh)')
 parser.add_argument('--time-varying', action='store_true', help='Kenh thay doi theo thoi gian')
+parser.add_argument('--correlation', type=float, default=0.0,
+                    help='Spatial correlation [0,1]. 0=independent, 0.5=medium, 0.8=high (default: 0)')
 parser.add_argument('--episodes', type=int, default=300, help='So episodes (default: 300)')
 parser.add_argument('--steps', type=int, default=100, help='So steps moi episode (default: 100)')
 parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')
@@ -61,6 +63,7 @@ env = RSMA_Env(
     noise_power_dBm=args.noise,
     channel_type=args.channel,
     time_varying=args.time_varying,
+    spatial_correlation=args.correlation,
     step_num=args.steps
 )
 
@@ -131,6 +134,7 @@ print(f"  Users (K):            {args.K}")
 print(f"  P_max:                {args.P_max} dBm")
 print(f"  Noise power:          {args.noise} dBm")
 print(f"  Channel:              {args.channel}")
+print(f"  Spatial correlation:   {args.correlation}")
 print(f"  Time-varying:         {args.time_varying}")
 print(f"  Episodes:             {episode_num}")
 print(f"  Steps/episode:        {step_num}")

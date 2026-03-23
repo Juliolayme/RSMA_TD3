@@ -35,14 +35,16 @@ class RSMA_Env:
                  channel_type='rayleigh', rician_factor=10.0,
                  user_distances=None, frequency=2.4e9, path_loss_exp=3.0,
                  time_varying=False, channel_correlation=0.9,
+                 spatial_correlation=0.0,
                  step_num=100,
                  # === RSMA reward shaping ===
-                 lambda_ratio=2.0,        # He so cho common_ratio = R_c/R_sum
+                 lambda_ratio=3.0,        # He so cho common_ratio = R_c/R_sum
                  lambda_log=0.5,          # He so cho log(1 + 5*R_c)
-                 collapse_threshold=0.05, # Nguong R_c de phat collapse
-                 collapse_penalty=2.0,    # Gia tri phat khi R_c < threshold
+                 bonus_cap=0.3,           # Cap bonus <= 30% cua R_sum (chong overshoot)
+                 collapse_threshold=0.1,  # Nguong R_c de phat collapse
+                 collapse_penalty=3.0,    # Gia tri phat khi R_c < threshold
                  # === Power floor ===
-                 min_power_common_ratio=0.10,  # Toi thieu 10% P_max cho common
+                 min_power_common_ratio=0.15,  # Toi thieu 15% P_max cho common
                  ):
         """
         Args:
@@ -73,6 +75,7 @@ class RSMA_Env:
         # === RSMA reward shaping ===
         self.lambda_ratio = lambda_ratio
         self.lambda_log = lambda_log
+        self.bonus_cap = bonus_cap
         self.collapse_threshold = collapse_threshold
         self.collapse_penalty = collapse_penalty
 
@@ -80,13 +83,15 @@ class RSMA_Env:
         self.min_power_common_ratio = min_power_common_ratio
 
         # === Tham so kenh ===
+        self.spatial_correlation = spatial_correlation
         self.channel_params = {
             'M': M, 'K': K,
             'channel_type': channel_type,
             'rician_factor': rician_factor,
             'frequency': frequency,
             'path_loss_exp': path_loss_exp,
-            'user_distances': user_distances
+            'user_distances': user_distances,
+            'spatial_correlation': spatial_correlation,
         }
 
         # === Kich thuoc state va action ===
@@ -399,28 +404,34 @@ class RSMA_Env:
         R_sum_private = np.sum(R_private)
         R_sum = np.sum(R_total)   # = R_c + R_sum_private (chinh xac)
 
-        # ============ REWARD (Multi-Component) ============
-        # Cong thuc:
-        #   reward = R_sum
-        #          + λ_ratio * (R_c / R_sum)     ... khuyến khích tỷ lệ common
-        #          + λ_log   * log(1 + 5·R_c)    ... smooth bonus, không nổ
-        #          - penalty  (nếu R_c < threshold)
+        # ============ REWARD (Capped Bonus) ============
+        # reward = R_sum + min(bonus, cap * R_sum) - penalty
         #
-        # Tai sao tot hon (1+λ)*R_c:
-        #   - R_c/R_sum ∈ [0,1]: normalized, gradient stable bat ke R_sum lon/nho
-        #   - log(1+5*R_c): tang nhanh khi R_c nho (khuyến khích khám phá),
-        #     bão hòa khi R_c lớn (không chiếm ưu thế)
-        #   - R_sum: giu muc tieu chinh (maximize throughput)
+        # bonus = λ_ratio * (R_c / R_sum) + λ_log * log(1 + 5*R_c)
+        # cap   = bonus_cap (default 0.3 = 30%)
+        #
+        # Tai sao CAP quan trong:
+        #   - Khong cap: bonus tang theo Pc → agent chon Pc=100% (overshoot)
+        #   - Voi cap 30%: bonus KHONG BAO GIO vuot 30% R_sum
+        #     → Optimal Pc = noi R_sum cao nhat (vi bonus da bi gioi han)
+        #     → Agent tu dong tim can bang Pc toi uu
+        #
+        # Vi du (ρ=0.5, M=8, K=4):
+        #   Pc=85%: R_sum=6.756, bonus=2.03 (capped), reward=8.78 ← BEST
+        #   Pc=95%: R_sum=6.530, bonus=1.96 (capped), reward=8.49
+        #   → Agent chon Pc=85% (toi uu!) thay vi 95% (qua cao)
         # ===================================================
         eps = 1e-6
-        common_ratio = R_c / (R_sum + eps)                # ∈ [0, 1]
-        common_log_bonus = np.log(1.0 + 5.0 * R_c)       # smooth, > 0
+        common_ratio = R_c / (R_sum + eps)
+        common_log_bonus = np.log(1.0 + 5.0 * R_c)
 
-        reward = (R_sum
-                  + self.lambda_ratio * common_ratio
-                  + self.lambda_log * common_log_bonus)
+        raw_bonus = (self.lambda_ratio * common_ratio
+                     + self.lambda_log * common_log_bonus)
+        capped_bonus = min(raw_bonus, self.bonus_cap * R_sum)
 
-        # Collapse penalty: phat khi common rate qua nho
+        reward = R_sum + capped_bonus
+
+        # Collapse penalty
         collapse_pen = 0.0
         if R_c < self.collapse_threshold:
             collapse_pen = self.collapse_penalty
